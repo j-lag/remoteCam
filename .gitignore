@@ -1,0 +1,13 @@
+# Portable Python used locally to build the PC app
+pc/Python312_x64/
+
+# PyInstaller / Python build output
+pc/build/
+pc/dist/
+*.spec
+__pycache__/
+*.pyc
+
+# Pi build output
+pi/uvc-bridge
+*.o

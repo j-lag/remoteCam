@@ -1,0 +1,13 @@
+[Unit]
+Description=RemoteCam - USB gadget (UVC webcam + configuration drive)
+After=local-fs.target systemd-modules-load.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStartPre=/usr/bin/python3 /opt/remotecam/agent.py prepare
+ExecStart=/opt/remotecam/gadget.sh up
+ExecStop=/opt/remotecam/gadget.sh down
+
+[Install]
+WantedBy=multi-user.target

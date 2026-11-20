@@ -1,0 +1,15 @@
+[Unit]
+Description=RemoteCam - network to UVC webcam bridge
+Requires=remotecam-gadget.service
+After=remotecam-gadget.service network.target
+PartOf=remotecam-gadget.service
+
+[Service]
+EnvironmentFile=-/var/lib/remotecam/camera.env
+ExecStart=/opt/remotecam/uvc-bridge
+Restart=always
+RestartSec=1
+Nice=-5
+
+[Install]
+WantedBy=multi-user.target

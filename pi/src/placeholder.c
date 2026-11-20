@@ -1,0 +1,171 @@
+/* RemoteCam - placeholder picture: plain background + text (5x7 bitmap font), libjpeg encoded */
+#include "placeholder.h"
+
+#include <ctype.h>
+#include <stddef.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+/* jpeglib.h needs stdio.h / stddef.h first */
+#include <jpeglib.h>
+
+struct glyph {
+    char c;
+    uint8_t r[7]; /* 7 rows, 5 bits per row (bit 4 = left column) */
+};
+
+static const struct glyph FONT[] = {
+    { ' ', { 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 } },
+    { 'A', { 0x0E, 0x11, 0x11, 0x1F, 0x11, 0x11, 0x11 } },
+    { 'B', { 0x1E, 0x11, 0x11, 0x1E, 0x11, 0x11, 0x1E } },
+    { 'C', { 0x0E, 0x11, 0x10, 0x10, 0x10, 0x11, 0x0E } },
+    { 'D', { 0x1C, 0x12, 0x11, 0x11, 0x11, 0x12, 0x1C } },
+    { 'E', { 0x1F, 0x10, 0x10, 0x1E, 0x10, 0x10, 0x1F } },
+    { 'F', { 0x1F, 0x10, 0x10, 0x1E, 0x10, 0x10, 0x10 } },
+    { 'G', { 0x0E, 0x11, 0x10, 0x17, 0x11, 0x11, 0x0F } },
+    { 'H', { 0x11, 0x11, 0x11, 0x1F, 0x11, 0x11, 0x11 } },
+    { 'I', { 0x0E, 0x04, 0x04, 0x04, 0x04, 0x04, 0x0E } },
+    { 'J', { 0x07, 0x02, 0x02, 0x02, 0x02, 0x12, 0x0C } },
+    { 'K', { 0x11, 0x12, 0x14, 0x18, 0x14, 0x12, 0x11 } },
+    { 'L', { 0x10, 0x10, 0x10, 0x10, 0x10, 0x10, 0x1F } },
+    { 'M', { 0x11, 0x1B, 0x15, 0x15, 0x11, 0x11, 0x11 } },
+    { 'N', { 0x11, 0x11, 0x19, 0x15, 0x13, 0x11, 0x11 } },
+    { 'O', { 0x0E, 0x11, 0x11, 0x11, 0x11, 0x11, 0x0E } },
+    { 'P', { 0x1E, 0x11, 0x11, 0x1E, 0x10, 0x10, 0x10 } },
+    { 'Q', { 0x0E, 0x11, 0x11, 0x11, 0x15, 0x12, 0x0D } },
+    { 'R', { 0x1E, 0x11, 0x11, 0x1E, 0x14, 0x12, 0x11 } },
+    { 'S', { 0x0F, 0x10, 0x10, 0x0E, 0x01, 0x01, 0x1E } },
+    { 'T', { 0x1F, 0x04, 0x04, 0x04, 0x04, 0x04, 0x04 } },
+    { 'U', { 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x0E } },
+    { 'V', { 0x11, 0x11, 0x11, 0x11, 0x11, 0x0A, 0x04 } },
+    { 'W', { 0x11, 0x11, 0x11, 0x15, 0x15, 0x15, 0x0A } },
+    { 'X', { 0x11, 0x11, 0x0A, 0x04, 0x0A, 0x11, 0x11 } },
+    { 'Y', { 0x11, 0x11, 0x0A, 0x04, 0x04, 0x04, 0x04 } },
+    { 'Z', { 0x1F, 0x01, 0x02, 0x04, 0x08, 0x10, 0x1F } },
+    { '0', { 0x0E, 0x11, 0x13, 0x15, 0x19, 0x11, 0x0E } },
+    { '1', { 0x04, 0x0C, 0x04, 0x04, 0x04, 0x04, 0x0E } },
+    { '2', { 0x0E, 0x11, 0x01, 0x02, 0x04, 0x08, 0x1F } },
+    { '3', { 0x1F, 0x02, 0x04, 0x02, 0x01, 0x11, 0x0E } },
+    { '4', { 0x02, 0x06, 0x0A, 0x12, 0x1F, 0x02, 0x02 } },
+    { '5', { 0x1F, 0x10, 0x1E, 0x01, 0x01, 0x11, 0x0E } },
+    { '6', { 0x06, 0x08, 0x10, 0x1E, 0x11, 0x11, 0x0E } },
+    { '7', { 0x1F, 0x01, 0x02, 0x04, 0x08, 0x08, 0x08 } },
+    { '8', { 0x0E, 0x11, 0x11, 0x0E, 0x11, 0x11, 0x0E } },
+    { '9', { 0x0E, 0x11, 0x11, 0x0F, 0x01, 0x02, 0x0C } },
+    { '.', { 0x00, 0x00, 0x00, 0x00, 0x00, 0x0C, 0x0C } },
+    { ':', { 0x00, 0x0C, 0x0C, 0x00, 0x0C, 0x0C, 0x00 } },
+    { '-', { 0x00, 0x00, 0x00, 0x1F, 0x00, 0x00, 0x00 } },
+    { '/', { 0x00, 0x01, 0x02, 0x04, 0x08, 0x10, 0x00 } },
+    { '_', { 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x1F } },
+    { '(', { 0x02, 0x04, 0x08, 0x08, 0x08, 0x04, 0x02 } },
+    { ')', { 0x08, 0x04, 0x02, 0x02, 0x02, 0x04, 0x08 } },
+    { '?', { 0x0E, 0x11, 0x01, 0x02, 0x04, 0x00, 0x04 } },
+};
+
+static const uint8_t *glyph_for(char ch)
+{
+    char c = (char)toupper((unsigned char)ch);
+    for (size_t i = 0; i < sizeof FONT / sizeof FONT[0]; i++)
+        if (FONT[i].c == c)
+            return FONT[i].r;
+    return glyph_for('?');
+}
+
+static void fill_rect(uint8_t *img, int w, int h, int x, int y, int rw, int rh,
+                      uint8_t r, uint8_t g, uint8_t b)
+{
+    if (x < 0) { rw += x; x = 0; }
+    if (y < 0) { rh += y; y = 0; }
+    if (x + rw > w) rw = w - x;
+    if (y + rh > h) rh = h - y;
+    for (int yy = y; yy < y + rh; yy++) {
+        uint8_t *p = img + ((size_t)yy * w + x) * 3;
+        for (int xx = 0; xx < rw; xx++) {
+            *p++ = r;
+            *p++ = g;
+            *p++ = b;
+        }
+    }
+}
+
+static void draw_text(uint8_t *img, int w, int h, int y, int scale, const char *s,
+                      uint8_t r, uint8_t g, uint8_t b)
+{
+    int n = (int)strlen(s);
+    int cw = 6 * scale;
+    int x0 = (w - (n * cw - scale)) / 2;
+    for (int k = 0; k < n; k++) {
+        const uint8_t *gl = glyph_for(s[k]);
+        for (int row = 0; row < 7; row++)
+            for (int col = 0; col < 5; col++)
+                if (gl[row] & (0x10 >> col))
+                    fill_rect(img, w, h, x0 + k * cw + col * scale, y + row * scale, scale, scale, r, g, b);
+    }
+}
+
+static int fit_scale(int w, const char *s, int scale)
+{
+    int n = (int)strlen(s);
+    while (scale > 1 && n * 6 * scale > w * 92 / 100)
+        scale--;
+    return scale;
+}
+
+int placeholder_make(int w, int h, const char *const *lines, int nlines,
+                     uint8_t **out, unsigned long *outlen)
+{
+    uint8_t *img = malloc((size_t)w * h * 3);
+    if (!img)
+        return -1;
+
+    fill_rect(img, w, h, 0, 0, w, h, 0x1E, 0x22, 0x30);            /* background */
+    fill_rect(img, w, h, 0, 0, w, h / 80 + 2, 0x2B, 0xB3, 0xA3);   /* top stripe */
+
+    int scales[16];
+    int total = 0;
+    if (nlines > 16)
+        nlines = 16;
+    for (int i = 0; i < nlines; i++) {
+        int s = (i == 0) ? h / 90 : h / 150;
+        if (s < 1)
+            s = 1;
+        scales[i] = fit_scale(w, lines[i], s);
+        total += scales[i] * 7 + scales[i] * 6;
+    }
+    int y = (h - total) / 2;
+    for (int i = 0; i < nlines; i++) {
+        if (i == 0)
+            draw_text(img, w, h, y, scales[i], lines[i], 0xFF, 0xFF, 0xFF);
+        else
+            draw_text(img, w, h, y, scales[i], lines[i], 0xB8, 0xC4, 0xD6);
+        y += scales[i] * 13;
+        if (i == 0)
+            y += scales[i] * 2;
+    }
+
+    struct jpeg_compress_struct c;
+    struct jpeg_error_mgr jerr;
+    c.err = jpeg_std_error(&jerr);
+    jpeg_create_compress(&c);
+    *out = NULL;
+    *outlen = 0;
+    jpeg_mem_dest(&c, out, outlen);
+    c.image_width = w;
+    c.image_height = h;
+    c.input_components = 3;
+    c.in_color_space = JCS_RGB;
+    jpeg_set_defaults(&c);
+    jpeg_set_quality(&c, 80, TRUE);
+    /* 4:2:2, the MJPEG format most widely accepted by UVC hosts */
+    c.comp_info[0].h_samp_factor = 2;
+    c.comp_info[0].v_samp_factor = 1;
+    jpeg_start_compress(&c, TRUE);
+    while (c.next_scanline < c.image_height) {
+        JSAMPROW row = img + (size_t)c.next_scanline * w * 3;
+        jpeg_write_scanlines(&c, &row, 1);
+    }
+    jpeg_finish_compress(&c);
+    jpeg_destroy_compress(&c);
+    free(img);
+    return 0;
+}
