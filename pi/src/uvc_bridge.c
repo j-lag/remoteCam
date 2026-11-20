@@ -93,6 +93,13 @@ struct app {
 
     unsigned st_frames, st_pc;
     double st_time;
+
+    /* bottleneck diagnostics, reported to the PC every 2 s */
+    unsigned rp_ticks, rp_frames, rp_new, rp_busy, rp_copies;
+    double rp_copy, rp_time;
+    uint64_t last_pc_fid;
+    double last_queued;
+    unsigned long long cpu_total, cpu_idle, cpu_soft, cpu_self;
 };
 
 static volatile sig_atomic_t g_running = 1;
@@ -108,9 +115,13 @@ static void on_signal(int s)
 /* Helpers                                                             */
 /* ------------------------------------------------------------------ */
 
-static size_t frame_bufsize(int w, int h)
+/* Maximum JPEG size of a frame: the value declared by gadget.sh (camera.frame_bpp),
+ * or 8 bits/pixel for an old uvc.info. */
+static size_t frame_bufsize(const struct frame_desc *f)
 {
-    size_t s = (size_t)w * h; /* ~8 bits/pixel: plenty for JPEG */
+    if (f->size)
+        return f->size;
+    size_t s = (size_t)f->width * f->height;
     return s < 524288 ? 524288 : s;
 }
 
@@ -162,12 +173,13 @@ static int load_info(struct app *a, const char *path)
     int def_index = -1;
     while (fgets(line, sizeof line, f)) {
         int i, w, h;
-        unsigned v;
-        if (sscanf(line, "frame %d %d %d", &i, &w, &h) == 3) {
+        unsigned v, size = 0;
+        if (sscanf(line, "frame %d %d %d %u", &i, &w, &h, &size) >= 3) {
             if (a->nframes < MAX_FRAMES && w > 0 && h > 0) {
                 a->frames[a->nframes].index = i;
                 a->frames[a->nframes].width = w;
                 a->frames[a->nframes].height = h;
+                a->frames[a->nframes].size = size;
                 a->nframes++;
             }
         } else if (sscanf(line, "vs_intf %d", &i) == 1) {
@@ -206,7 +218,7 @@ static void fill_ctrl(struct app *a, struct uvc_streaming_control *c, int fi, ui
     c->bFormatIndex = 1;
     c->bFrameIndex = a->frames[fi].index;
     c->dwFrameInterval = ival;
-    c->dwMaxVideoFrameSize = frame_bufsize(a->frames[fi].width, a->frames[fi].height);
+    c->dwMaxVideoFrameSize = frame_bufsize(&a->frames[fi]);
     c->dwMaxPayloadTransferSize = a->maxpayload;
     c->bmFramingInfo = 3;
     c->bPreferedVersion = 1;
@@ -223,13 +235,13 @@ static void set_format(struct app *a)
     fmt.fmt.pix.height = f->height;
     fmt.fmt.pix.pixelformat = V4L2_PIX_FMT_MJPEG;
     fmt.fmt.pix.field = V4L2_FIELD_NONE;
-    fmt.fmt.pix.sizeimage = frame_bufsize(f->width, f->height);
+    fmt.fmt.pix.sizeimage = frame_bufsize(f);
     if (ioctl(a->vfd, VIDIOC_S_FMT, &fmt) < 0) {
         LOG("uvc: S_FMT %dx%d: %s", f->width, f->height, strerror(errno));
-        a->sizeimage = frame_bufsize(f->width, f->height);
+        a->sizeimage = frame_bufsize(f);
     } else {
         a->sizeimage = fmt.fmt.pix.sizeimage ? fmt.fmt.pix.sizeimage
-                                             : frame_bufsize(f->width, f->height);
+                                             : frame_bufsize(f);
     }
 }
 
@@ -371,7 +383,10 @@ static void queue_frame(struct app *a)
         }
     }
     if (data && b->fid != fid) {
+        double t0 = mono_now();
         memcpy(b->mem, data, len);
+        a->rp_copy += mono_now() - t0;
+        a->rp_copies++;
         b->fid = fid;
         b->used = len;
     }
@@ -389,9 +404,16 @@ static void queue_frame(struct app *a)
         return;
     }
     b->queued = 1;
+    a->last_queued = mono_now();
     a->st_frames++;
-    if (src == 1)
+    a->rp_frames++;
+    if (src == 1) {
         a->st_pc++;
+        if (fid != a->last_pc_fid) {
+            a->rp_new++;
+            a->last_pc_fid = fid;
+        }
+    }
 }
 
 static void dequeue_done(struct app *a)
@@ -495,13 +517,111 @@ static void start_stream(struct app *a)
     notify_mode(a);
 }
 
-static void tick(struct app *a)
+static int queued_count(struct app *a)
 {
     int q = 0;
     for (int i = 0; i < a->nbufs; i++)
         q += a->bufs[i].queued;
-    if (q < MAX_QUEUED)
+    return q;
+}
+
+/* Frame timer: keeps the host fed at the negotiated rate (repeats the last frame or
+ * shows the placeholder). Skipped when a fresh PC frame was just pushed. */
+static void tick(struct app *a)
+{
+    a->rp_ticks++;
+    if (mono_now() - a->last_queued < a->cur_interval * 1e-7 * 0.5)
+        return;
+    if (queued_count(a) < MAX_QUEUED)
         queue_frame(a);
+    else
+        a->rp_busy++; /* USB host has not consumed the previous frames yet */
+}
+
+/* A new frame from the PC goes to USB as soon as it arrives, instead of waiting for
+ * the next timer tick (timer and network are not in sync: frames were dropped). */
+static void push_new_frame(struct app *a)
+{
+    size_t l;
+    int fw, fh;
+    uint64_t id;
+    double ft;
+    const struct frame_desc *f = &a->frames[a->cur];
+    if (!net_frame(a->net, &l, &fw, &fh, &id, &ft) || id == a->last_pc_fid ||
+        fw != f->width || fh != f->height)
+        return;
+    if (queued_count(a) < MAX_QUEUED)
+        queue_frame(a);
+}
+
+/* ------------------------------------------------------------------ */
+/* Bottleneck diagnostics                                              */
+/* ------------------------------------------------------------------ */
+
+/* CPU usage since the previous call: whole system, softirq (WiFi/TCP), this process */
+static void cpu_usage(struct app *a, int *total, int *soft, int *self)
+{
+    unsigned long long v[10] = { 0 }, sum = 0, ut = 0, st = 0;
+    *total = *soft = *self = -1;
+    FILE *f = fopen("/proc/stat", "r");
+    if (f) {
+        if (fscanf(f, "cpu %llu %llu %llu %llu %llu %llu %llu %llu",
+                   &v[0], &v[1], &v[2], &v[3], &v[4], &v[5], &v[6], &v[7]) == 8) {
+            for (int i = 0; i < 8; i++)
+                sum += v[i];
+            unsigned long long idle = v[3] + v[4];
+            unsigned long long dt = sum - a->cpu_total;
+            if (a->cpu_total && dt) {
+                *total = (int)(100 * (dt - (idle - a->cpu_idle)) / dt);
+                *soft = (int)(100 * (v[6] - a->cpu_soft) / dt);
+            }
+            f = freopen("/proc/self/stat", "r", f);
+            if (f) {
+                char buf[1024];
+                size_t n = fread(buf, 1, sizeof buf - 1, f);
+                buf[n] = 0;
+                const char *p = strrchr(buf, ')');
+                /* after ")": state(3) ... utime(14) stime(15) */
+                if (p && sscanf(p + 2, "%*c %*d %*d %*d %*d %*d %*u %*u %*u %*u %*u %llu %llu",
+                                &ut, &st) == 2) {
+                    if (a->cpu_total && dt)
+                        *self = (int)(100 * (ut + st - a->cpu_self) / dt);
+                    a->cpu_self = ut + st;
+                }
+            }
+            a->cpu_total = sum;
+            a->cpu_idle = idle;
+            a->cpu_soft = v[6];
+        }
+        if (f)
+            fclose(f);
+    }
+}
+
+static void report_stats(struct app *a, double now)
+{
+    double dt = now - a->rp_time;
+    if (dt <= 0)
+        return;
+    unsigned rx_frames;
+    uint64_t rx_bytes;
+    net_rx_stats(a->net, &rx_frames, &rx_bytes);
+    int cpu, soft, self;
+    cpu_usage(a, &cpu, &soft, &self);
+    char b[512];
+    snprintf(b, sizeof b,
+             "{\"type\":\"stats\",\"dt\":%.2f,\"host_fps\":%d,\"streaming\":%s,"
+             "\"ticks\":%u,\"usb_frames\":%u,\"usb_new\":%u,\"usb_busy\":%u,"
+             "\"rx_frames\":%u,\"rx_bytes\":%llu,\"copy_ms\":%.2f,"
+             "\"cpu\":%d,\"cpu_softirq\":%d,\"cpu_bridge\":%d}\n",
+             dt, fps_of(a->cur_interval), a->streaming ? "true" : "false",
+             a->rp_ticks, a->rp_frames, a->rp_new, a->rp_busy,
+             rx_frames, (unsigned long long)rx_bytes,
+             a->rp_copies ? 1000.0 * a->rp_copy / a->rp_copies : 0.0, cpu, soft, self);
+    net_send_line(a->net, b);
+    a->rp_ticks = a->rp_frames = a->rp_new = a->rp_busy = a->rp_copies = 0;
+    a->rp_copy = 0;
+    a->rp_time = now;
 }
 
 /* ------------------------------------------------------------------ */
@@ -516,6 +636,8 @@ static void vs_request(struct app *a, uint8_t req, uint8_t cs, uint16_t wlen,
     struct uvc_streaming_control *ctrl = (struct uvc_streaming_control *)resp->data;
     int len = wlen < sizeof *ctrl ? wlen : (int)sizeof *ctrl;
 
+    if (g_debug && req != UVC_SET_CUR)
+        LOG("uvc: %s GET %02x", cs == UVC_VS_PROBE_CONTROL ? "PROBE" : "COMMIT", req);
     switch (req) {
     case UVC_SET_CUR:
         a->set_cur_target = (cs == UVC_VS_PROBE_CONTROL) ? 1 : 2;
@@ -654,6 +776,10 @@ static void handle_data(struct app *a, const struct uvc_request_data *d)
     if (fi < 0)
         fi = a->def_frame;
     uint32_t ival = clamp_interval(a, in.dwFrameInterval);
+    if (g_debug)
+        LOG("uvc: %s SET_CUR: hint %04x frame %u interval %u -> frame %d interval %u (%d fps)",
+            target == 1 ? "PROBE" : "COMMIT", in.bmHint, in.bFrameIndex, in.dwFrameInterval,
+            a->frames[fi].index, ival, fps_of(ival));
 
     if (target == 1) {
         fill_ctrl(a, &a->probe, fi, ival);
@@ -827,8 +953,8 @@ int main(void)
     if (load_info(a, info) < 0)
         LOG("warning: %s not found, using defaults", info);
     if (a->nframes == 0) {
-        a->frames[0] = (struct frame_desc){ 1, 1920, 1080 };
-        a->frames[1] = (struct frame_desc){ 2, 1280, 720 };
+        a->frames[0] = (struct frame_desc){ 1, 1920, 1080, 0 };
+        a->frames[1] = (struct frame_desc){ 2, 1280, 720, 0 };
         a->nframes = 2;
         a->def_frame = 0;
     }
@@ -905,10 +1031,14 @@ int main(void)
                 tick(a);
         }
         net_handle(a->net, &r, &w);
+        if (a->streaming)
+            push_new_frame(a);
         net_periodic(a->net);
         check_native(a);
 
         double now = mono_now();
+        if (now - a->rp_time >= 2.0)
+            report_stats(a, now);
         if (now - last_stat >= 30.0) {
             if (a->streaming)
                 LOG("stats: %.1f fps to the host (%.1f from the PC), client: %s",

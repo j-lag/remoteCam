@@ -66,6 +66,10 @@ struct net {
 
     int nat_w, nat_h, nat_new;
     double last_beacon;
+
+    /* reception statistics (reset by net_rx_stats) */
+    unsigned rx_frames;
+    uint64_t rx_bytes;
 };
 
 /* ---------- mini JSON (known format, no need for a real parser) ---------- */
@@ -293,6 +297,8 @@ static void handle_packet(struct net *n)
         n->fh = n->fbuf[2] | (n->fbuf[3] << 8);
         n->fid++;
         n->ftime = mono_now();
+        n->rx_frames++;
+        n->rx_bytes += n->plen;
         cli_send(n, "{\"type\":\"ack\"}\n");
     }
     /* unknown types: ignored (forward compatibility) */
@@ -508,4 +514,18 @@ int net_take_native(struct net *n, int *w, int *h)
     *w = n->nat_w;
     *h = n->nat_h;
     return 1;
+}
+
+void net_rx_stats(struct net *n, unsigned *frames, uint64_t *bytes)
+{
+    *frames = n->rx_frames;
+    *bytes = n->rx_bytes;
+    n->rx_frames = 0;
+    n->rx_bytes = 0;
+}
+
+void net_send_line(struct net *n, const char *line)
+{
+    if (n->cli >= 0 && n->authed)
+        cli_send(n, line);
 }

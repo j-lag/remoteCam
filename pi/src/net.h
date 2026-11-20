@@ -25,3 +25,9 @@ const char *net_peer(struct net *n);
 
 /* Native resolution announced by the PC (returns 1 only once per announcement) */
 int net_take_native(struct net *n, int *w, int *h);
+
+/* Frames / bytes received since the previous call */
+void net_rx_stats(struct net *n, unsigned *frames, uint64_t *bytes);
+
+/* Sends a JSON line to the connected PC (ignored if none) */
+void net_send_line(struct net *n, const char *line);

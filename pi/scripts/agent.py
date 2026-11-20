@@ -212,14 +212,20 @@ def parse_config(text):
         maxpacket = int(get("camera", "usb_maxpacket", "1024"))
     except ValueError:
         maxpacket = 1024
-    if maxpacket not in (1024, 2048, 3072):
+    if maxpacket not in (1024, 2048):  # 3072 (high-bandwidth isoc) breaks the Pi Zero dwc2
         maxpacket = 1024
+    try:
+        bpp = int(get("camera", "frame_bpp", "2"))
+    except ValueError:
+        bpp = 2
+    bpp = min(8, max(1, bpp))
     native = "auto" if get("camera", "native", "auto").lower() in ("auto", "oui", "yes", "1") else "off"
     cfg["camera"] = {
         "resolutions": res,
         "native": native,
         "max_fps": fps,
         "maxpacket": maxpacket,
+        "frame_bpp": bpp,
         "usb_name": _safe(get("camera", "usb_name"), 31) or "RemoteCam",
     }
     return cfg
@@ -232,6 +238,7 @@ def make_env(cfg):
         f"CAM_NATIVE={c['native']}",
         f"CAM_FPS={c['max_fps']}",
         f"CAM_MAXPACKET={c['maxpacket']}",
+        f"CAM_FRAME_BPP={c['frame_bpp']}",
         f"CAM_USB_NAME='{c['usb_name']}'",
     ]
     bridge = [
@@ -423,8 +430,16 @@ def write_status_file(cfg):
 # Modes
 # --------------------------------------------------------------------------
 
+def update_static_files():
+    """Files refreshed on every boot (so an update reaches existing drives)."""
+    src = os.path.join(BASE, "viewer.html")
+    if os.path.exists(src):
+        copy_into_image(src, "viewer.html")
+
+
 def prepare():
     ensure_image()
+    update_static_files()
     text = read_config_text()
     cfg = parse_config(text) if text is not None else None
     if cfg is None:

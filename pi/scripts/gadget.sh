@@ -15,6 +15,7 @@ CAM_RESOLUTIONS=${CAM_RESOLUTIONS:-"1920x1080 1280x720 640x360"}
 CAM_NATIVE=${CAM_NATIVE:-auto}
 CAM_FPS=${CAM_FPS:-30}
 CAM_MAXPACKET=${CAM_MAXPACKET:-1024}
+CAM_FRAME_BPP=${CAM_FRAME_BPP:-2}
 CAM_USB_NAME=${CAM_USB_NAME:-RemoteCam}
 
 log() { echo "[gadget] $*"; }
@@ -113,11 +114,13 @@ up() {
         fw=${r%x*}; fh=${r#*x}
         d="$F/streaming/mjpeg/m/$r"
         mkdir -p "$d" || continue
-        size=$((fw * fh)); [ $size -lt 524288 ] && size=524288
+        # Maximum JPEG size per frame. Windows derives the frame rates it may use from
+        # this value and the USB bandwidth: an overestimate makes the host pick 5 fps.
+        size=$((fw * fh * CAM_FRAME_BPP / 8)); [ $size -lt 131072 ] && size=131072
         wr "$d/wWidth" "$fw"
         wr "$d/wHeight" "$fh"
-        wr "$d/dwMinBitRate" $((fw * fh * 8 * 5))
-        wr "$d/dwMaxBitRate" $((fw * fh * 8 * 30))
+        wr "$d/dwMinBitRate" $((size * 8 * 5))
+        wr "$d/dwMaxBitRate" $((size * 8 * 30))
         wr "$d/dwMaxVideoFrameBufferSize" "$size"
         wr "$d/dwDefaultFrameInterval" "${INTERVALS%% *}"
         printf '%s\n' $INTERVALS > "$d/dwFrameInterval" || log "dwFrameInterval rejected for $r"
@@ -127,7 +130,7 @@ up() {
             n=$(cat "$d/bFrameIndex" 2>/dev/null)
             [[ $n =~ ^[0-9]+$ ]] && [ "$n" -gt 0 ] && fidx=$n
         fi
-        FRAMES+=("frame $fidx $fw $fh")
+        FRAMES+=("frame $fidx $fw $fh $size")
         [ -n "$first" ] || first=$fidx
     done
     mkdir -p "$F/streaming/header/h"
@@ -168,7 +171,7 @@ up() {
         echo "default ${first:-1}"
         printf '%s\n' "${FRAMES[@]}"
     } > "$INFO"
-    log "gadget active on $UDC: $RES; intervals $INTERVALS; packet $CAM_MAXPACKET"
+    log "gadget active on $UDC: $RES; intervals $INTERVALS; packet $CAM_MAXPACKET; $CAM_FRAME_BPP bits/pixel"
 }
 
 case "${1:-}" in

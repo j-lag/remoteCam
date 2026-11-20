@@ -12,4 +12,9 @@ This drive is provided by the RemoteCam Raspberry Pi.
    Raspberry Pi automatically and starts sending the selected screen.
 5. In Teams: Settings > Devices > Camera > RemoteCam.
 
+Full resolution screen sharing in Teams:
+   open viewer.html (double-click, opens in Edge / Chrome), allow the
+   camera, press F for full screen, then share that screen in Teams.
+   Teams screen sharing keeps the full resolution, a Teams camera does not.
+
 STATUS.TXT shows the state of the last session (WiFi, IP address).

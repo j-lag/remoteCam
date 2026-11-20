@@ -100,6 +100,14 @@ The Lite image boots faster still.
 3. In Teams: *Settings > Devices > Camera > RemoteCam*. The preview shows the
    placeholder with the Pi IP address, then the PCa screen.
 
+**Best quality: share the viewer window instead of using the camera.** Teams
+recompresses a camera to 720p/1080p, but screen sharing keeps the full resolution.
+Open `viewer.html` from the REMOTECAM drive (it opens in Edge / Chrome, nothing to
+install), allow the camera, press **F** for full screen, then share that screen in
+Teams. The page asks for the largest resolution and 30 fps, and shows the requested
+and received frame rates (**I** toggles the panel). The Windows Camera app, by
+contrast, picks a low frame rate (5 fps) by itself at large resolutions.
+
 ### On PCa (the sender)
 ```bat
 cd pc
@@ -115,6 +123,14 @@ Or run `build_exe.bat` to produce a standalone `RemoteCam.exe` (in `pc\dist\`).
 * **Windows firewall**: on first launch, allow Python on *private* networks, otherwise
   UDP discovery receives nothing (a manual IP still works).
 * When no application is using the camera, the sender only sends 1 frame per second.
+* The **Diagnostics** panel shows, every 0.5 s, the time spent per frame on the PC
+  (capture, prepare, encode), the network throughput and acknowledgement delay, the Pi
+  figures (frames received / sent to USB, USB busy, CPU and WiFi load) and a
+  **Bottleneck** verdict.
+* `simplejpeg` + `numpy` (in `requirements.txt`) are optional: when installed, frames at
+  the native resolution are encoded straight from the BGRA capture, skipping a colour
+  conversion (~13 ms per 3440x1440 frame). Frames are sent by a separate thread, so
+  capture and encoding overlap with the network transfer.
 
 ## Configuration (`remotecam.ini`)
 
@@ -127,7 +143,8 @@ Or run `build_exe.bat` to produce a standalone `RemoteCam.exe` (in `pc\dist\`).
 | `camera.resolutions` | `1920x1080, 1280x720, 640x360` | Resolutions offered to the host |
 | `camera.native` | `auto` | Also offers the native resolution of the PCa screen (see below) |
 | `camera.max_fps` | `30` | Maximum frame rate offered (30/25/20/15/10/5) |
-| `camera.usb_maxpacket` | `1024` | 1024 ≈ 8 MB/s; 2048/3072 = more bandwidth if the controller copes |
+| `camera.usb_maxpacket` | `1024` | 1024 ≈ 8 MB/s; 2048 ≈ 16 MB/s (3072 does not work with the Pi Zero USB controller) |
+| `camera.frame_bpp` | `2` | Maximum JPEG size declared per frame (bits/pixel, 1-8). Windows only offers the frame rates where *size × fps* fits the USB bandwidth: lower it (or raise `usb_maxpacket`) to get more fps at large resolutions |
 | `camera.usb_name` | `RemoteCam` | Webcam name shown by the OS |
 
 Any change in the `[camera]` section re-enumerates the USB device: the webcam and the
@@ -166,7 +183,7 @@ few frames per second; the host can still pick 1080p.
 
 * **USB bandwidth**: with `usb_maxpacket = 1024`, isochronous bandwidth is about 8 MB/s.
   A 1080p JPEG at q85 is often 250 to 600 KB, i.e. roughly 12 to 30 fps depending on the
-  content. To go faster: lower the quality, use 4:2:0, or try `usb_maxpacket = 2048/3072`.
+  content. To go faster: lower the quality, use 4:2:0, or try `usb_maxpacket = 2048`.
 * **Teams recompresses** the camera video (often 720p, sometimes 1080p, limited bitrate).
   Fine text stays less sharp than a real screen share: increasing display scaling on
   PCa (125 to 150 %) helps a lot.

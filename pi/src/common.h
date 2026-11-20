@@ -14,6 +14,7 @@ struct frame_desc {
     int index;   /* USB bFrameIndex (1..n) */
     int width;
     int height;
+    unsigned size;   /* dwMaxVideoFrameBufferSize declared to the host (0 = unknown) */
 };
 
 static inline double mono_now(void)

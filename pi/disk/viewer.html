@@ -1,0 +1,171 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>RemoteCam viewer</title>
+<style>
+  :root { color-scheme: dark; }
+  html, body { margin: 0; height: 100%; background: #000; overflow: hidden;
+               font: 14px/1.4 "Segoe UI", system-ui, sans-serif; color: #e8e8e8; }
+  video { position: fixed; inset: 0; width: 100%; height: 100%; object-fit: contain; background: #000; }
+  body.hide-cursor { cursor: none; }
+  #panel { position: fixed; top: 12px; left: 12px; padding: 10px 14px; border-radius: 8px;
+           background: rgba(20, 22, 30, .82); max-width: calc(100% - 48px);
+           transition: opacity .4s; }
+  #panel.hidden { opacity: 0; pointer-events: none; }
+  #panel b { color: #fff; }
+  #info { font-variant-numeric: tabular-nums; }
+  #msg { color: #ffb4a8; margin-top: 4px; }
+  #msg:empty { display: none; }
+  select, button { font: inherit; margin-top: 6px; background: #2a2d38; color: #e8e8e8;
+                   border: 1px solid #555; border-radius: 4px; padding: 2px 6px; }
+  .keys { color: #9aa; font-size: 12px; margin-top: 6px; }
+</style>
+</head>
+<body>
+<video id="v" autoplay muted playsinline></video>
+<div id="panel">
+  <div><b>RemoteCam viewer</b></div>
+  <div id="info">Starting...</div>
+  <div id="msg"></div>
+  <div>
+    <select id="dev" title="Camera"></select>
+    <button id="fs" type="button">Full screen</button>
+  </div>
+  <div class="keys">F / double-click: full screen &nbsp;·&nbsp; I: show / hide this panel</div>
+</div>
+<script>
+"use strict";
+// Opens the RemoteCam webcam at its largest resolution and highest frame rate.
+// Meant to be shown full screen and shared in Teams ("share screen" keeps full
+// resolution, unlike a Teams camera).
+const video = document.getElementById("v");
+const info = document.getElementById("info");
+const msg = document.getElementById("msg");
+const dev = document.getElementById("dev");
+const panel = document.getElementById("panel");
+let stream = null, frames = 0, lastCount = performance.now(), fps = 0;
+
+function stop() {
+  if (stream) stream.getTracks().forEach(t => t.stop());
+  stream = null;
+}
+
+async function listCameras() {
+  const all = await navigator.mediaDevices.enumerateDevices();
+  const cams = all.filter(d => d.kind === "videoinput");
+  const keep = dev.value;
+  dev.innerHTML = "";
+  for (const c of cams) {
+    const o = document.createElement("option");
+    o.value = c.deviceId;
+    o.textContent = c.label || "Camera";
+    dev.appendChild(o);
+  }
+  const rc = cams.find(c => /remotecam/i.test(c.label));
+  dev.value = cams.some(c => c.deviceId === keep) ? keep : (rc ? rc.deviceId : (cams[0] || {}).deviceId || "");
+  return cams;
+}
+
+async function open() {
+  stop();
+  msg.textContent = "";
+  try {
+    if (!dev.value) {
+      // first call: ask for permission so that device labels become visible
+      const s = await navigator.mediaDevices.getUserMedia({ video: true });
+      s.getTracks().forEach(t => t.stop());
+      await listCameras();
+    }
+    stream = await navigator.mediaDevices.getUserMedia({ video: {
+      deviceId: dev.value ? { exact: dev.value } : undefined,
+      width: { ideal: 7680 }, height: { ideal: 4320 }, frameRate: { ideal: 30 } } });
+    const track = stream.getVideoTracks()[0];
+    // ask for the best mode the camera reports
+    const caps = track.getCapabilities ? track.getCapabilities() : {};
+    if (caps.width && caps.height) {
+      try {
+        await track.applyConstraints({ width: { ideal: caps.width.max }, height: { ideal: caps.height.max },
+                                       frameRate: { ideal: (caps.frameRate && caps.frameRate.max) || 30 } });
+      } catch (e) { /* keep the current mode */ }
+    }
+    track.addEventListener("ended", () => { msg.textContent = "Camera disconnected, retrying..."; retry(); });
+    video.srcObject = stream;
+    await listCameras();
+  } catch (e) {
+    msg.textContent = (e && e.name === "NotAllowedError")
+      ? "Camera access denied: allow it in the browser address bar, then press F5."
+      : "Camera not available (" + (e && (e.name || e.message)) + "), retrying...";
+    retry();
+  }
+}
+
+let retryTimer = null;
+function retry() {
+  stop();
+  clearTimeout(retryTimer);
+  retryTimer = setTimeout(open, 2000);
+}
+
+function countFrame() {
+  frames++;
+  video.requestVideoFrameCallback(countFrame);
+}
+if ("requestVideoFrameCallback" in HTMLVideoElement.prototype) video.requestVideoFrameCallback(countFrame);
+
+setInterval(() => {
+  const now = performance.now();
+  fps = frames * 1000 / (now - lastCount);
+  frames = 0;
+  lastCount = now;
+  const t = stream && stream.getVideoTracks()[0];
+  if (!t) return;
+  const s = t.getSettings();
+  info.innerHTML = `${s.width || video.videoWidth}x${s.height || video.videoHeight}` +
+    ` &nbsp;·&nbsp; requested ${s.frameRate ? Math.round(s.frameRate) : "?"} fps` +
+    ` &nbsp;·&nbsp; received ${fps.toFixed(1)} fps`;
+}, 1000);
+
+function toggleFullscreen() {
+  if (document.fullscreenElement) document.exitFullscreen();
+  else document.documentElement.requestFullscreen().catch(() => {});
+}
+document.getElementById("fs").onclick = toggleFullscreen;
+video.ondblclick = toggleFullscreen;
+dev.onchange = open;
+document.addEventListener("keydown", e => {
+  const k = e.key.toLowerCase();
+  if (k !== "f" && k !== "i") return;
+  e.preventDefault();          // e.g. do not change the camera list selection
+  if (k === "f") toggleFullscreen();
+  else togglePanel();
+});
+
+// Panel: "auto" = shown on mouse movement, hidden after 3 s idle;
+// "shown" / "hidden" = forced with the I key. The pointer hides after 3 s idle.
+let panelMode = "auto", idleTimer = null;
+function setPanel(visible) { panel.classList.toggle("hidden", !visible); }
+function onActivity(delay) {
+  document.body.classList.remove("hide-cursor");
+  if (panelMode === "auto") setPanel(true);
+  clearTimeout(idleTimer);
+  idleTimer = setTimeout(() => {
+    if (panelMode === "auto") setPanel(false);
+    document.body.classList.add("hide-cursor");
+  }, delay || 3000);
+}
+function togglePanel() {
+  panelMode = panel.classList.contains("hidden") ? "shown" : "hidden";
+  setPanel(panelMode === "shown");
+}
+document.addEventListener("mousemove", () => onActivity());
+onActivity(8000);
+
+if (navigator.mediaDevices && navigator.mediaDevices.addEventListener)
+  navigator.mediaDevices.addEventListener("devicechange", () => { if (!stream) open(); else listCameras(); });
+if (!navigator.mediaDevices) msg.textContent = "This browser does not allow camera access from this page.";
+else open();
+</script>
+</body>
+</html>

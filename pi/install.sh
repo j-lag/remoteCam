@@ -29,6 +29,7 @@ install -m 755 scripts/gadget.sh /opt/remotecam/gadget.sh
 install -m 755 scripts/agent.py /opt/remotecam/agent.py
 install -m 644 disk/remotecam.ini /opt/remotecam/remotecam.ini
 install -m 644 disk/README.txt /opt/remotecam/README.txt
+install -m 644 disk/viewer.html /opt/remotecam/viewer.html
 install -m 644 systemd/*.service /etc/systemd/system/
 
 echo "== USB controller in peripheral mode (dwc2)"
@@ -132,6 +133,10 @@ fi
 
 systemctl daemon-reload
 systemctl enable remotecam-gadget.service remotecam-bridge.service remotecam-agent.service
+# update of a running system: restart what is already running so the new code is used
+# (restarting the gadget also restarts the bridge)
+systemctl try-restart remotecam-agent.service remotecam-gadget.service || true
+systemctl is-active -q remotecam-gadget.service && systemctl start remotecam-bridge.service
 
 echo
 echo "Install complete. Reboot: sudo reboot"
