@@ -46,6 +46,12 @@ networks cannot talk to each other and nothing can be installed on PCb.
 ## Hardware
 
 * **Raspberry Pi Zero W or Zero 2 W** (the plain Zero has no WiFi).
+  > ⚠️ **Pi Zero W: set `max_fps = 5` in `remotecam.ini`.** Above 5 fps the single
+  > core cannot keep up with the USB interrupts and the kernel UVC gadget driver
+  > crashes (oops in `uvcg_video_pump`, the Pi freezes). At 5 fps it runs stably.
+  > **Pi Zero 2 W: `max_fps = 30` (default) is fine.** Each resolution only offers the
+  > frame rates the Pi can sustain (about 8 fps at 3440x1440, 20 fps at 1080p, 30 fps at
+  > 720p) and frames are sent as fast as the link allows.
 * A micro-USB **data** cable plugged into the Pi port labelled **"USB"** (not "PWR").
   The cable also powers the Pi.
 * A micro-SD card (4 GB or more). A fast A1/A2 card shortens boot time.
@@ -142,18 +148,21 @@ Or run `build_exe.bat` to produce a standalone `RemoteCam.exe` (in `pc\dist\`).
 | `wifiN.ssid/password/security/identity/hidden` | | WiFi networks, by priority |
 | `camera.resolutions` | `1920x1080, 1280x720, 640x360` | Resolutions offered to the host |
 | `camera.native` | `auto` | Also offers the native resolution of the PCa screen (see below) |
-| `camera.max_fps` | `30` | Maximum frame rate offered (30/25/20/15/10/5) |
-| `camera.usb_maxpacket` | `1024` | 1024 ≈ 8 MB/s; 2048 ≈ 16 MB/s (3072 does not work with the Pi Zero USB controller) |
-| `camera.frame_bpp` | `2` | Maximum JPEG size declared per frame (bits/pixel, 1-8). Windows only offers the frame rates where *size × fps* fits the USB bandwidth: lower it (or raise `usb_maxpacket`) to get more fps at large resolutions |
+| `camera.max_fps` | `30` | Maximum frame rate offered (30/25/20/15/10/5). **Use `5` on a Pi Zero W** (see Hardware); keep `30` on a Zero 2 W |
+| `camera.max_throughput` | `auto` | Sustainable throughput in KB/s (auto: 3000 on a Zero W, 5500 on a Zero 2 W). Each resolution only offers the frame rates where *frame size × fps* fits it |
+| `camera.frame_bpp` | `1` | Maximum JPEG size per frame (bits/pixel, 1-8). The PC lowers the JPEG quality when a frame would be larger. Higher = better quality, fewer fps |
 | `camera.usb_name` | `RemoteCam` | Webcam name shown by the OS |
 
-Any change in the `[camera]` section re-enumerates the USB device: the webcam and the
-drive disappear and come back about 2 s later.
+Any change in the `[camera]` section **reboots the Pi** to apply it (the webcam and the
+drive come back after the boot, about 1 minute). Rebuilding the USB gadget on a running
+system can crash the kernel UVC driver, so it is never done live.
 
 **Native resolution**: with `native = auto`, when PCa connects, the Pi adds the
 resolution of the captured screen (e.g. 2560x1440) in front of the webcam resolutions.
-This happens once per resolution, never while the camera is in use, and triggers a USB
-re-enumeration. Very large resolutions (e.g. 3440x1440) are limited by USB bandwidth to a
+It follows the current screen: when PCa switches to another resolution, the old native
+one is replaced (or removed, if the new one is already in `resolutions`). The change is
+recorded immediately but **takes effect at the next start of the Pi** (unplug / replug
+it), for the same reason as above. Very large resolutions (e.g. 3440x1440) are limited by USB bandwidth to a
 few frames per second; the host can still pick 1080p.
 
 ## Reliability
@@ -181,9 +190,17 @@ few frames per second; the host can still pick 1080p.
 
 ## Performance and limitations
 
-* **USB bandwidth**: with `usb_maxpacket = 1024`, isochronous bandwidth is about 8 MB/s.
+* **Automatic frame rates**: the Pi only offers, for each resolution, the frame rates it
+  can sustain (`frame size × fps ≤ max_throughput`). On a Zero W with the defaults:
+  3440x1440 and 2560x1440 → 5 fps, 1920x1080 → 10 fps, 1280x720 → 25 fps, 640x360 →
+  30 fps. Offering more made the host pick rates the Pi could not carry: the USB stream
+  stalled and the Pi crashed. A Zero 2 W roughly doubles these rates.
+  **On a Zero W this is not enough**: even 10 fps at 1080p triggered a kernel crash in
+  the UVC gadget driver, so `max_fps = 5` is required there (see Hardware).
+* **USB bandwidth**: the isochronous packet size is fixed at 1024 bytes (about 8 MB/s);
+  larger packets (high-bandwidth isochronous mode) stall the Pi Zero USB controller.
   A 1080p JPEG at q85 is often 250 to 600 KB, i.e. roughly 12 to 30 fps depending on the
-  content. To go faster: lower the quality, use 4:2:0, or try `usb_maxpacket = 2048`.
+  content. To go faster: lower the quality or use 4:2:0.
 * **Teams recompresses** the camera video (often 720p, sometimes 1080p, limited bitrate).
   Fine text stays less sharp than a real screen share: increasing display scaling on
   PCa (125 to 150 %) helps a lot.
@@ -213,10 +230,11 @@ systemd-analyze blame | head                   # boot time analysis
 |---|---|
 | Nothing appears on PCb | Wrong port (PWR) or charge-only cable; `ls /sys/class/udc`; wait for the watchdog (30 s) or unplug / replug |
 | `ls /sys/class/udc` is empty | `config.txt` must contain `dtoverlay=dwc2,dr_mode=peripheral` under `[all]` (not only under `[cm5]` etc.) |
-| Webcam present, black picture in Teams | `journalctl -u remotecam-bridge`; try `usb_maxpacket = 1024` |
+| Webcam present, black picture in Teams | `journalctl -u remotecam-bridge -u remotecam-gadget` |
 | "frame too large" in the logs | Lower the JPEG quality on PCa |
 | The PC does not find the Pi | Windows firewall (private network), WiFi client isolation: enter the IP manually |
 | WiFi not connected | `STATUS.TXT`, `country`, `journalctl -u remotecam-agent` |
+| Pi freezes when the camera starts (Zero W) | Set `max_fps = 5` in `remotecam.ini`; watch `sudo dmesg -w` over SSH for `uvcg_video_pump` oopses |
 | Very slow boot | Use the Lite image, run `install.sh` without `--no-boot-tuning`, check `systemd-analyze blame` |
 
 ## License

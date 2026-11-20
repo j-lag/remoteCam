@@ -15,7 +15,9 @@ CAM_RESOLUTIONS=${CAM_RESOLUTIONS:-"1920x1080 1280x720 640x360"}
 CAM_NATIVE=${CAM_NATIVE:-auto}
 CAM_FPS=${CAM_FPS:-30}
 CAM_MAXPACKET=${CAM_MAXPACKET:-1024}
-CAM_FRAME_BPP=${CAM_FRAME_BPP:-2}
+CAM_FRAME_BPP=${CAM_FRAME_BPP:-1}
+CAM_THROUGHPUT=${CAM_THROUGHPUT:-auto}
+CAM_USB_INTERVAL=${CAM_USB_INTERVAL:-auto}
 CAM_USB_NAME=${CAM_USB_NAME:-RemoteCam}
 
 log() { echo "[gadget] $*"; }
@@ -55,12 +57,33 @@ up() {
 
     # --- frame intervals (100 ns units), fastest first ---
     local INTERVALS="" iv fps
-    for iv in 333333 400000 500000 666666 1000000 2000000; do
+    for iv in 333333 400000 500000 666666 1000000 1333333 2000000; do
         fps=$(( (10000000 + iv / 2) / iv ))
         [ "$fps" -le "$CAM_FPS" ] && INTERVALS="$INTERVALS $iv"
     done
     INTERVALS=${INTERVALS# }
     [ -n "$INTERVALS" ] || INTERVALS=2000000
+
+    # --- sustainable throughput (bytes/s): each resolution only offers the frame rates
+    # the Pi can carry, so the host can never pick a rate that stalls USB or the CPU ---
+    local BUDGET model usb zero2=0
+    model=$(tr -d '\0' < /proc/device-tree/model 2>/dev/null)
+    case "$model" in *"Zero 2"*) zero2=1 ;; esac
+    if [[ $CAM_THROUGHPUT =~ ^[0-9]+$ ]]; then
+        BUDGET=$((CAM_THROUGHPUT * 1024))
+    elif [ $zero2 = 1 ]; then
+        BUDGET=$((5500 * 1024))     # 4 cores
+    else
+        BUDGET=$((3000 * 1024))     # Zero W: WiFi + USB on one core
+    fi
+    # one USB transfer every 125 us (1) on a Zero 2 W, every 250 us (2) on a Zero W
+    if ! [[ $CAM_USB_INTERVAL =~ ^[1-4]$ ]]; then
+        CAM_USB_INTERVAL=2
+        [ $zero2 = 1 ] && CAM_USB_INTERVAL=1
+    fi
+    # 70 % of the isochronous bandwidth (bInterval N = one packet every 2^(N-1) microframes)
+    usb=$((CAM_MAXPACKET * 8000 / (1 << (CAM_USB_INTERVAL - 1)) * 70 / 100))
+    [ "$usb" -lt "$BUDGET" ] && BUDGET=$usb
 
     # --- resolutions: native one (if known) first, then the configured list ---
     local RES="" r n
@@ -97,7 +120,10 @@ up() {
     local F=$G/functions/uvc.usb0
     mkdir -p "$F"
     wr "$F/streaming_maxpacket" "$CAM_MAXPACKET"
-    wr "$F/streaming_interval" 1
+    # bInterval 2 = one isochronous transfer every 250 us instead of 125 us: halves the
+    # dwc2 interrupt load, which otherwise starves the single-core Zero W (kernel oops in
+    # uvcg_video_pump at stream start, seen at 10 fps)
+    wr "$F/streaming_interval" "$CAM_USB_INTERVAL"
     [ -f "$F/streaming_maxburst" ] && wr "$F/streaming_maxburst" 0
     [ -f "$F/function_name" ] && wr "$F/function_name" "$CAM_USB_NAME"
     # no control (brightness...) advertised
@@ -116,21 +142,32 @@ up() {
         mkdir -p "$d" || continue
         # Maximum JPEG size per frame. Windows derives the frame rates it may use from
         # this value and the USB bandwidth: an overestimate makes the host pick 5 fps.
-        size=$((fw * fh * CAM_FRAME_BPP / 8)); [ $size -lt 131072 ] && size=131072
+        size=$((fw * fh * CAM_FRAME_BPP / 8)); [ $size -lt 65536 ] && size=65536
+        # frame rates this resolution can sustain: size x fps <= BUDGET
+        local RIV="" slowest=""
+        for iv in $INTERVALS; do
+            slowest=$iv
+            [ $((size * 10000000)) -le $((BUDGET * iv)) ] && RIV="$RIV $iv"
+        done
+        RIV=${RIV# }
+        [ -n "$RIV" ] || RIV=$slowest
         wr "$d/wWidth" "$fw"
         wr "$d/wHeight" "$fh"
-        wr "$d/dwMinBitRate" $((size * 8 * 5))
-        wr "$d/dwMaxBitRate" $((size * 8 * 30))
+        wr "$d/dwMinBitRate" $((size * 8 * 10000000 / slowest))
+        wr "$d/dwMaxBitRate" $((size * 8 * 10000000 / ${RIV%% *}))
         wr "$d/dwMaxVideoFrameBufferSize" "$size"
-        wr "$d/dwDefaultFrameInterval" "${INTERVALS%% *}"
-        printf '%s\n' $INTERVALS > "$d/dwFrameInterval" || log "dwFrameInterval rejected for $r"
+        wr "$d/dwDefaultFrameInterval" "${RIV%% *}"
+        # the whole list must reach configfs in a single write(): cat from a file does that
+        printf '%s\n' $RIV > "$RUN/intervals.tmp"
+        cat "$RUN/intervals.tmp" > "$d/dwFrameInterval" || log "dwFrameInterval rejected for $r"
+        log "$r: max $(( (10000000 + ${RIV%% *} / 2) / ${RIV%% *} )) fps ($((size / 1024)) KB/frame max), intervals kept: $(tr '\n' ' ' < "$d/dwFrameInterval" 2>/dev/null)"
         idx=$((idx + 1))
         local fidx=$idx
         if [ -r "$d/bFrameIndex" ]; then
             n=$(cat "$d/bFrameIndex" 2>/dev/null)
             [[ $n =~ ^[0-9]+$ ]] && [ "$n" -gt 0 ] && fidx=$n
         fi
-        FRAMES+=("frame $fidx $fw $fh $size")
+        FRAMES+=("frame $fidx $fw $fh $size $RIV")
         [ -n "$first" ] || first=$fidx
     done
     mkdir -p "$F/streaming/header/h"
@@ -171,7 +208,7 @@ up() {
         echo "default ${first:-1}"
         printf '%s\n' "${FRAMES[@]}"
     } > "$INFO"
-    log "gadget active on $UDC: $RES; intervals $INTERVALS; packet $CAM_MAXPACKET; $CAM_FRAME_BPP bits/pixel"
+    log "gadget active on $UDC ($model): $RES; packet $CAM_MAXPACKET every $((125 << (CAM_USB_INTERVAL - 1))) us; $CAM_FRAME_BPP bits/pixel; budget $((BUDGET / 1024)) KB/s"
 }
 
 case "${1:-}" in

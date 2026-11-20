@@ -93,19 +93,27 @@ async function open() {
     track.addEventListener("ended", () => { msg.textContent = "Camera disconnected, retrying..."; retry(); });
     video.srcObject = stream;
     await listCameras();
+    failures = 0;
   } catch (e) {
-    msg.textContent = (e && e.name === "NotAllowedError")
-      ? "Camera access denied: allow it in the browser address bar, then press F5."
-      : "Camera not available (" + (e && (e.name || e.message)) + "), retrying...";
+    const name = e && (e.name || e.message);
+    if (name === "NotAllowedError") {
+      msg.textContent = "Camera access denied: allow it in the browser address bar, then press F5.";
+      return;
+    }
+    // after a USB re-enumeration the camera gets a new deviceId: forget the old one
+    if (name === "OverconstrainedError" || name === "NotFoundError") dev.value = "";
+    msg.textContent = "Camera not available (" + name + "), retrying...";
     retry();
   }
 }
 
-let retryTimer = null;
+// retries slow down (2 s, 4 s, 8 s... up to 30 s) so a missing camera is not hammered
+let retryTimer = null, failures = 0;
 function retry() {
   stop();
   clearTimeout(retryTimer);
-  retryTimer = setTimeout(open, 2000);
+  failures++;
+  retryTimer = setTimeout(open, Math.min(30000, 2000 * Math.pow(2, failures - 1)));
 }
 
 function countFrame() {
@@ -125,6 +133,10 @@ setInterval(() => {
   info.innerHTML = `${s.width || video.videoWidth}x${s.height || video.videoHeight}` +
     ` &nbsp;·&nbsp; requested ${s.frameRate ? Math.round(s.frameRate) : "?"} fps` +
     ` &nbsp;·&nbsp; received ${fps.toFixed(1)} fps`;
+  const c = t.getCapabilities ? t.getCapabilities() : {};
+  if (c.frameRate && c.width)
+    info.innerHTML += `<br>camera offers up to ${c.width.max}x${c.height.max}, ` +
+      `${Math.round(c.frameRate.min || 0)}-${Math.round(c.frameRate.max)} fps`;
 }, 1000);
 
 function toggleFullscreen() {

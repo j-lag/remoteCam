@@ -15,6 +15,8 @@ struct frame_desc {
     int width;
     int height;
     unsigned size;   /* dwMaxVideoFrameBufferSize declared to the host (0 = unknown) */
+    uint32_t ivals[8]; /* frame intervals offered for this resolution, ascending */
+    int nivals;        /* 0 = use the global list */
 };
 
 static inline double mono_now(void)

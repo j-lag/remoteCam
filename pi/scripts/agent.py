@@ -212,13 +212,20 @@ def parse_config(text):
         maxpacket = int(get("camera", "usb_maxpacket", "1024"))
     except ValueError:
         maxpacket = 1024
-    if maxpacket not in (1024, 2048):  # 3072 (high-bandwidth isoc) breaks the Pi Zero dwc2
-        maxpacket = 1024
+    # 2048/3072 use high-bandwidth isochronous transfers: the Pi Zero dwc2 controller
+    # stalls with them (no picture, or a crash at high frame rates)
+    maxpacket = 1024
     try:
-        bpp = int(get("camera", "frame_bpp", "2"))
+        bpp = int(get("camera", "frame_bpp", "1"))
     except ValueError:
-        bpp = 2
+        bpp = 1
     bpp = min(8, max(1, bpp))
+    throughput = get("camera", "max_throughput", "auto").lower()
+    if throughput != "auto":
+        try:
+            throughput = str(min(20000, max(200, int(throughput))))
+        except ValueError:
+            throughput = "auto"
     native = "auto" if get("camera", "native", "auto").lower() in ("auto", "oui", "yes", "1") else "off"
     cfg["camera"] = {
         "resolutions": res,
@@ -226,6 +233,7 @@ def parse_config(text):
         "max_fps": fps,
         "maxpacket": maxpacket,
         "frame_bpp": bpp,
+        "throughput": throughput,
         "usb_name": _safe(get("camera", "usb_name"), 31) or "RemoteCam",
     }
     return cfg
@@ -239,6 +247,7 @@ def make_env(cfg):
         f"CAM_FPS={c['max_fps']}",
         f"CAM_MAXPACKET={c['maxpacket']}",
         f"CAM_FRAME_BPP={c['frame_bpp']}",
+        f"CAM_THROUGHPUT={c['throughput']}",
         f"CAM_USB_NAME='{c['usb_name']}'",
     ]
     bridge = [
@@ -466,8 +475,11 @@ def apply_all(text):
 
     gadget_changed, bridge_changed = write_env(cfg)
     if gadget_changed:
-        log("camera settings changed: reconfiguring the USB gadget")
-        run(["systemctl", "restart", "remotecam-gadget.service"], timeout=60)
+        # Rebooting is the only safe way to apply new USB descriptors: tearing the UVC
+        # gadget down on a running system can crash the kernel (uvc_function_unbind).
+        log("camera settings changed: rebooting to apply them")
+        os.sync()
+        run(["systemctl", "reboot"], timeout=30)
     elif bridge_changed:
         log("name/key changed: restarting the bridge")
         run(["systemctl", "restart", "remotecam-bridge.service"], timeout=30)
@@ -502,8 +514,11 @@ class UsbWatchdog:
 
     @staticmethod
     def gadget_running():
-        p = run(["systemctl", "is-active", "remotecam-gadget.service"], timeout=10)
-        return p is not None and p.stdout.decode().strip() == "active"
+        # Both services must be active: the bridge is what connects the gadget to the
+        # host, so when it was stopped on purpose (manual debugging), do not interfere.
+        p = run(["systemctl", "is-active", "remotecam-gadget.service", "remotecam-bridge.service"],
+                timeout=10)
+        return p is not None and p.stdout.decode().split() == ["active", "active"]
 
     def check(self):
         st = self.state()

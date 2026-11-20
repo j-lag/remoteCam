@@ -7,7 +7,8 @@ Type=oneshot
 RemainAfterExit=yes
 ExecStartPre=/usr/bin/python3 /opt/remotecam/agent.py prepare
 ExecStart=/opt/remotecam/gadget.sh up
-ExecStop=/opt/remotecam/gadget.sh down
+# No ExecStop: tearing the UVC gadget down on a running system can crash the kernel
+# (oops in uvc_function_unbind). At shutdown the gadget simply goes away with the power.
 
 [Install]
 WantedBy=multi-user.target

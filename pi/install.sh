@@ -135,8 +135,8 @@ systemctl daemon-reload
 systemctl enable remotecam-gadget.service remotecam-bridge.service remotecam-agent.service
 # update of a running system: restart what is already running so the new code is used
 # (restarting the gadget also restarts the bridge)
-systemctl try-restart remotecam-agent.service remotecam-gadget.service || true
-systemctl is-active -q remotecam-gadget.service && systemctl start remotecam-bridge.service
+# (the gadget itself is never rebuilt on a running system, see remotecam-gadget.service)
+systemctl try-restart remotecam-agent.service remotecam-bridge.service || true
 
 echo
 echo "Install complete. Reboot: sudo reboot"

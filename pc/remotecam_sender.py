@@ -590,7 +590,7 @@ def diagnose(engine, conn):
                        f"{ps.get('cpu_softirq')}%): send smaller frames (quality, 4:2:0)")
     if busy > 0.3:
         return lines, ("USB: the host does not take the frames fast enough "
-                       "(lower the quality, or try usb_maxpacket = 2048)")
+                       "(lower the quality, or lower max_throughput in remotecam.ini)")
     if wait > 0.3:
         return lines, (f"network (WiFi): ~{ambps:.0f} Mbit/s for {avg / 1024:.0f} KB per frame. "
                        "Smaller frames (quality, 4:2:0) or a better WiFi signal help")

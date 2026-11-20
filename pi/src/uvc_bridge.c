@@ -49,7 +49,6 @@
 #define MAX_QUEUED      2
 #define MAX_INTERVALS   8
 #define NATIVE_FILE     "/var/lib/remotecam/native.txt"
-#define GADGET_SERVICE  "remotecam-gadget.service"
 
 struct buf {
     void *mem;
@@ -138,15 +137,28 @@ static int find_frame(struct app *a, int bidx)
     return -1;
 }
 
-/* intervals sorted ascending (fps descending) */
-static uint32_t clamp_interval(struct app *a, uint32_t req)
+/* Intervals offered for a resolution (gadget.sh limits the frame rate of each one to
+ * what the Pi can sustain), sorted ascending (fps descending). */
+static const uint32_t *frame_intervals(struct app *a, int fi, int *n)
 {
+    if (fi >= 0 && fi < a->nframes && a->frames[fi].nivals > 0) {
+        *n = a->frames[fi].nivals;
+        return a->frames[fi].ivals;
+    }
+    *n = a->nintervals;
+    return a->intervals;
+}
+
+static uint32_t clamp_interval(struct app *a, int fi, uint32_t req)
+{
+    int n;
+    const uint32_t *iv = frame_intervals(a, fi, &n);
     if (req == 0)
-        return a->intervals[0];
-    for (int i = 0; i < a->nintervals; i++)
-        if (a->intervals[i] + 100 >= req)
-            return a->intervals[i];
-    return a->intervals[a->nintervals - 1];
+        return iv[0];
+    for (int i = 0; i < n; i++)
+        if (iv[i] + 100 >= req)
+            return iv[i];
+    return iv[n - 1];
 }
 
 static void get_ip(char *out, size_t cap)
@@ -172,14 +184,26 @@ static int load_info(struct app *a, const char *path)
     char line[512];
     int def_index = -1;
     while (fgets(line, sizeof line, f)) {
-        int i, w, h;
+        int i, w, h, pos = 0;
         unsigned v, size = 0;
-        if (sscanf(line, "frame %d %d %d %u", &i, &w, &h, &size) >= 3) {
+        if (sscanf(line, "frame %d %d %d %u%n", &i, &w, &h, &size, &pos) >= 3) {
             if (a->nframes < MAX_FRAMES && w > 0 && h > 0) {
-                a->frames[a->nframes].index = i;
-                a->frames[a->nframes].width = w;
-                a->frames[a->nframes].height = h;
-                a->frames[a->nframes].size = size;
+                struct frame_desc *fd = &a->frames[a->nframes];
+                memset(fd, 0, sizeof *fd);
+                fd->index = i;
+                fd->width = w;
+                fd->height = h;
+                fd->size = size;
+                /* optional per-resolution intervals after the size */
+                char *p = pos ? line + pos : NULL, *end;
+                while (p && fd->nivals < (int)(sizeof fd->ivals / sizeof fd->ivals[0])) {
+                    unsigned long x = strtoul(p, &end, 10);
+                    if (end == p)
+                        break;
+                    if (x > 0)
+                        fd->ivals[fd->nivals++] = (uint32_t)x;
+                    p = end;
+                }
                 a->nframes++;
             }
         } else if (sscanf(line, "vs_intf %d", &i) == 1) {
@@ -649,11 +673,11 @@ static void vs_request(struct app *a, uint8_t req, uint8_t cs, uint16_t wlen,
         break;
     case UVC_GET_MIN:
     case UVC_GET_DEF:
-        fill_ctrl(a, ctrl, a->def_frame, a->intervals[0]);
+        fill_ctrl(a, ctrl, a->def_frame, clamp_interval(a, a->def_frame, 0));
         resp->length = len;
         break;
     case UVC_GET_MAX:
-        fill_ctrl(a, ctrl, a->nframes - 1, a->intervals[0]);
+        fill_ctrl(a, ctrl, a->nframes - 1, clamp_interval(a, a->nframes - 1, 0));
         resp->length = len;
         break;
     case UVC_GET_RES:
@@ -775,7 +799,7 @@ static void handle_data(struct app *a, const struct uvc_request_data *d)
     int fi = find_frame(a, in.bFrameIndex);
     if (fi < 0)
         fi = a->def_frame;
-    uint32_t ival = clamp_interval(a, in.dwFrameInterval);
+    uint32_t ival = clamp_interval(a, fi, in.dwFrameInterval);
     if (g_debug)
         LOG("uvc: %s SET_CUR: hint %04x frame %u interval %u -> frame %d interval %u (%d fps)",
             target == 1 ? "PROBE" : "COMMIT", in.bmHint, in.bFrameIndex, in.dwFrameInterval,
@@ -832,17 +856,16 @@ static void check_native(struct app *a)
         a->pend_nw = w & ~1;
         a->pend_nh = h & ~1;
     }
-    if (!a->pend_nw || a->streaming)
-        return; /* never while the host is using the camera */
+    if (!a->pend_nw)
+        return;
     w = a->pend_nw;
     h = a->pend_nh;
     a->pend_nw = a->pend_nh = 0;
     if (w < 160 || h < 120 || w > 4096 || h > 2304)
         return;
-    for (int i = 0; i < a->nframes; i++)
-        if (a->frames[i].width == w && a->frames[i].height == h)
-            return; /* already exposed */
 
+    /* native.txt holds the resolution added for the PC screen; it follows the
+     * current screen, so an old native resolution does not stay first in the list */
     char want[32], have[32] = "";
     snprintf(want, sizeof want, "%dx%d", w, h);
     FILE *f = fopen(NATIVE_FILE, "r");
@@ -854,16 +877,36 @@ static void check_native(struct app *a)
     }
     if (!strcmp(have, want))
         return; /* already requested: avoids a loop if the kernel rejected it */
-    f = fopen(NATIVE_FILE, "w");
-    if (!f) {
-        LOG("native: cannot write %s", NATIVE_FILE);
-        return;
+
+    int exposed = 0;
+    for (int i = 0; i < a->nframes; i++)
+        if (a->frames[i].width == w && a->frames[i].height == h)
+            exposed = 1;
+    if (exposed) {
+        /* the screen resolution is one of the configured ones: no extra resolution */
+        if (!have[0])
+            return;
+        if (unlink(NATIVE_FILE) < 0) {
+            LOG("native: cannot remove %s", NATIVE_FILE);
+            return;
+        }
+        LOG("native: screen is now %s (configured): %s will be removed at the next start "
+            "of the Pi (unplug / replug it)", want, have);
+    } else {
+        f = fopen(NATIVE_FILE, "w");
+        if (!f) {
+            LOG("native: cannot write %s", NATIVE_FILE);
+            return;
+        }
+        fprintf(f, "%s\n", want);
+        fclose(f);
+        LOG("native: screen is now %s: offered from the next start of the Pi "
+            "(unplug / replug it), replacing %s", want, have[0] ? have : "none");
     }
-    fprintf(f, "%s\n", want);
-    fclose(f);
-    LOG("native: adding resolution %s, reconfiguring the USB gadget", want);
-    if (system("systemctl --no-block restart " GADGET_SERVICE) != 0)
-        LOG("native: failed to restart " GADGET_SERVICE);
+    sync();
+    /* Applied at the next start of the Pi (next USB plug-in), never live: tearing down
+     * the UVC gadget while the system runs crashes the kernel driver (oops in
+     * uvc_function_unbind, seen on a Zero 2 W after a few stream starts/stops). */
 }
 
 /* ------------------------------------------------------------------ */
@@ -953,8 +996,8 @@ int main(void)
     if (load_info(a, info) < 0)
         LOG("warning: %s not found, using defaults", info);
     if (a->nframes == 0) {
-        a->frames[0] = (struct frame_desc){ 1, 1920, 1080, 0 };
-        a->frames[1] = (struct frame_desc){ 2, 1280, 720, 0 };
+        a->frames[0] = (struct frame_desc){ .index = 1, .width = 1920, .height = 1080 };
+        a->frames[1] = (struct frame_desc){ .index = 2, .width = 1280, .height = 720 };
         a->nframes = 2;
         a->def_frame = 0;
     }
@@ -976,7 +1019,7 @@ int main(void)
     }
 
     a->cur = a->def_frame;
-    a->cur_interval = a->intervals[0];
+    a->cur_interval = clamp_interval(a, a->cur, 0);
     fill_ctrl(a, &a->probe, a->cur, a->cur_interval);
     fill_ctrl(a, &a->commit, a->cur, a->cur_interval);
     set_format(a);
